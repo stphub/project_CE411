@@ -1,0 +1,835 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Firebase_ESP_Client.h>
+#include <HTTPClient.h>
+#include "time.h"
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// ==========================================
+// 1. ข้อมูลการเชื่อมต่อ
+// ==========================================
+#define WIFI_SSID       "GloveWiFi"
+#define WIFI_PASSWORD   "1234567890"
+#define API_KEY         "AIzaSyAY9TqQEY_PsbC2dHniwKVQCJFkmMGRlTI"
+#define DATABASE_URL    "glove-a8c55-default-rtdb.asia-southeast1.firebasedatabase.app"
+const String BOT_TOKEN = "7982958960:AAHqjJhoiThej2qhMJN6cW6xMRweC_CduPE";
+const String CHAT_ID   = "8326240788";
+
+// ==========================================
+// 2. การตั้งค่าระบบ
+// ==========================================
+const char* ntpServer          = "pool.ntp.org";
+const long  gmtOffset_sec      = 25200;
+const int   daylightOffset_sec = 0;
+
+#define BUZZER_PIN         23
+#define SOS_BUTTON_PIN      4
+#define HEART_RATE_PIN     34
+
+// --- Fall Detection ---
+#define FALL_TRIGGER_G              25.0f
+#define FALL_IMPACT_MIN_SAMPLES         5
+#define FALL_GYRO_MIN               1.5f
+#define FALL_STILL_G_MAX           13.0f
+#define FALL_POST_STILL_MS         800UL
+#define FALL_PRE_ALERT_MS          7000
+
+// --- Step ---
+#define STEP_PEAK_G                16.0f
+#define STEP_VALLEY_G               8.5f
+#define STEP_DEBOUNCE_MS            450
+
+// --- Heart Rate (แก้: ค่าใหม่สำหรับ contact sensor) ---
+#define IBI_MIN_MS                  450
+#define IBI_MAX_MS                 2000
+#define IBI_BUFFER_SIZE               4
+#define HR_LPF_ALPHA                  3   
+#define HR_ADAPTIVE_ALPHA             2   
+#define HR_PEAK_RATIO              0.22f   
+#define HR_PEAK_TIMEOUT_MS         2500
+#define HR_MIN_BPM                   40
+#define HR_MAX_BPM                  140
+#define HR_MIN_THRESHOLD             18   
+
+// --- Health Score ---
+#define STRESS_PENALTY_LVL            3
+#define STRESS_SCORE_PENALTY         10
+#define HEALTH_STEP_MAX            100
+#define HEALTH_SCORE_BASE            60
+#define HEALTH_SCORE_MAX            100
+
+// --- Wrist ---
+#define WRIST_UP_PITCH             25.0f
+#define WRIST_DOWN_PITCH           10.0f
+
+// --- WiFi ---
+#define WIFI_RECONNECT_BASE_MS    2000UL
+#define WIFI_RECONNECT_MAX_MS    30000UL
+
+// --- Tasks ---
+#define SENSOR_TASK_STACK         12288
+#define CLOUD_TASK_STACK            12288
+#define ALERT_QUEUE_LEN                4
+#define ALERT_MSG_MAX                512
+#define MAX_FALL_LOG      5  // ← เพิ่ม
+#define MAX_SOS_LOG       5 
+
+// ==========================================
+// 3. Motion Engine
+// ==========================================
+#define ME_WINDOW              50
+#define ME_WARMUP_SAMPLES      (ME_WINDOW / 2)
+#define ME_VAR_STILL_MAX       1.2f
+#define ME_VAR_MOVING_MAX      4.0f
+#define ME_VAR_WALKING_MAX    14.0f
+#define ME_GYRO_STILL          0.10f
+#define ME_GYRO_MOVING         0.20f
+
+// ==========================================
+// 4. Helper Macros
+// ==========================================
+#define SAFE_STRCPY(dst, src) \
+  do { strncpy(dst, src, sizeof(dst) - 1); dst[sizeof(dst) - 1] = '\0'; } while(0)
+
+// เปิดตอน debug HR: uncomment บรรทัดนี้
+// #define DEBUG_HR
+
+// ==========================================
+// 5. ตัวแปรระบบ
+// ==========================================
+Adafruit_MPU6050 mpu;
+FirebaseData     fbdo;
+FirebaseAuth     auth;
+FirebaseConfig   config;
+
+TaskHandle_t SensorTaskHandle;
+TaskHandle_t CloudTaskHandle;
+
+SemaphoreHandle_t dataMutex;
+QueueHandle_t     alertQueue;
+
+enum ActivityState { ACT_STILL, ACT_MOVING, ACT_WALKING, ACT_RUNNING };
+const char* activityLabel[] = { "Still", "Moving", "Walking", "Running" };
+
+enum FallPhase { FALL_NONE, FALL_PRE_ALERT, FALL_CONFIRMED };
+
+struct SharedData {
+  float x, y, z, totalG;
+  float gyroMag;
+  int   bpm;
+  float hrvSDNN;
+  int   stressLevel;
+  int   stepCount;
+  int   exerciseCount;
+  int   healthScore;
+  bool  isSOS;
+  bool  isFallen;
+  int   fallCountdown;
+  char  fallPhase[16];
+  ActivityState activity;
+  FallPhase     currentFall;
+  unsigned long fallTriggerTime;
+  int  ibiFilledCount;
+  bool ibiReady;
+  int  fallCount;          // ← เพิ่ม
+  int  sosCount;           // ← เพิ่ม
+   char fallTimes[MAX_FALL_LOG][10];  // แทน lastFallTime
+  char sosTimes[MAX_SOS_LOG][10]; 
+} shared = {};
+
+#define LOCK()   xSemaphoreTake(dataMutex, portMAX_DELAY)
+#define UNLOCK() xSemaphoreGive(dataMutex)
+
+// ==========================================
+// 6. Motion Engine
+// ==========================================
+struct MotionWindow {
+  float gBuf[ME_WINDOW];
+  float gyroBuf[ME_WINDOW];
+  int   head;
+  int   count;
+
+  void push(float g, float gyro) {
+    gBuf[head]    = g;
+    gyroBuf[head] = gyro;
+    head = (head + 1) % ME_WINDOW;
+    if (count < ME_WINDOW) count++;
+  }
+
+  void stats(float& outVarG, float& outAvgGyro) {
+    if (count == 0) { outVarG = outAvgGyro = 0.0f; return; }
+    float sumG = 0.0f, sumGyro = 0.0f;
+    for (int i = 0; i < count; i++) { sumG += gBuf[i]; sumGyro += gyroBuf[i]; }
+    float avgG = sumG / count;
+    outAvgGyro  = sumGyro / count;
+    float sumSq = 0.0f;
+    for (int i = 0; i < count; i++) { float d = gBuf[i] - avgG; sumSq += d * d; }
+    outVarG = sumSq / count;
+  }
+} motionWin = {};
+
+ActivityState classifyActivity() {
+  if (motionWin.count < ME_WARMUP_SAMPLES) return ACT_STILL;
+  float varG, avgGyro;
+  motionWin.stats(varG, avgGyro);
+  if (varG <= ME_VAR_STILL_MAX  && avgGyro <= ME_GYRO_STILL)  return ACT_STILL;
+  if (varG <= ME_VAR_MOVING_MAX && avgGyro <= ME_GYRO_MOVING) return ACT_MOVING;
+  if (varG <= ME_VAR_WALKING_MAX)                               return ACT_WALKING;
+  return ACT_RUNNING;
+}
+
+// ==========================================
+// 7. Telegram (แก้: URL encode + error log)
+// ==========================================
+String urlEncode(String str) {
+  String encoded = "";
+  for (int i = 0; i < str.length(); i++) {
+    unsigned char c = str.charAt(i);
+    if (c == ' ') {
+      encoded += '+';
+    } else if (isAlphaNumeric(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+      encoded += (char)c;
+    } else {
+      char buf[4];
+      sprintf(buf, "%%%02X", c);
+      encoded += buf;
+    }
+  }
+  return encoded;
+}
+void sendTelegramAlert(String msg) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  
+  // ตัดส่งทีละ 3000 ตัว (เผื่อ multi-byte)
+  const int CHUNK = 3000;
+  int total = msg.length();
+  int sent  = 0;
+
+  while (sent < total) {
+    String chunk = msg.substring(sent, min(sent + CHUNK, total));
+    
+    HTTPClient http;
+    String url = "https://api.telegram.org/bot" + BOT_TOKEN + "/sendMessage";
+    http.begin(url);
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+    String body = "chat_id=" + CHAT_ID + "&text=" + urlEncode(chunk);
+    int httpCode = http.POST(body);
+    if (httpCode > 0) {
+      Serial.printf("[Telegram] Sent chunk (%d)\n", httpCode);
+    } else {
+      Serial.printf("[Telegram] Failed: %s\n", http.errorToString(httpCode).c_str());
+    }
+    http.end();
+    sent += CHUNK;
+    if (sent < total) vTaskDelay(pdMS_TO_TICKS(500)); // หน่วงระหว่าง chunk
+  }
+}
+// แก้: log เมื่อ queue เต็ม
+void queueAlert(const char* msg) {
+  char buf[ALERT_MSG_MAX];
+  strncpy(buf, msg, ALERT_MSG_MAX - 1);
+  buf[ALERT_MSG_MAX - 1] = '\0';
+  if (xQueueSend(alertQueue, buf, 0) != pdTRUE) {
+    Serial.println("[Warning] Alert queue full");
+  }
+}
+
+// ==========================================
+// 8. Fall Handler (ไม่มี goto)
+// ==========================================
+void handleFallDetection(
+  float ltotalG, float lgyroMag,
+  int&           impactSamples,
+  bool&          impactDetected,
+  unsigned long& impactTime,
+  bool&          wentStillOnce,
+  bool&          buttonCancelledFall,
+  unsigned long& sosPresStart
+) {
+  LOCK();
+  FallPhase     currentFall = shared.currentFall;
+  unsigned long fallTrigger = shared.fallTriggerTime;
+  UNLOCK();
+
+  if (currentFall == FALL_NONE) {
+    if (ltotalG > FALL_TRIGGER_G && lgyroMag > FALL_GYRO_MIN) {
+      impactSamples++;
+    } else {
+      impactSamples = 0;
+    }
+    if (impactSamples >= FALL_IMPACT_MIN_SAMPLES) {
+      impactSamples  = 0;
+      impactDetected = true;
+      impactTime     = millis();
+      wentStillOnce  = false;
+      LOCK();
+      shared.currentFall     = FALL_PRE_ALERT;
+      shared.fallTriggerTime = millis();
+      UNLOCK();
+    }
+    return;
+  }
+
+  if (currentFall == FALL_PRE_ALERT) {
+    unsigned long elapsed         = millis() - fallTrigger;
+    unsigned long timeSinceImpact = millis() - impactTime;
+
+    if (ltotalG < FALL_STILL_G_MAX) wentStillOnce = true;
+
+    if (timeSinceImpact > FALL_POST_STILL_MS && !wentStillOnce) {
+      LOCK();
+      shared.currentFall   = FALL_NONE;
+      shared.fallCountdown = 0;
+      SAFE_STRCPY(shared.fallPhase, "none");
+      UNLOCK();
+      impactDetected = false;
+      wentStillOnce  = false;
+      impactTime     = 0;
+      return;
+    }
+
+    int cd = max(0, (int)((FALL_PRE_ALERT_MS - (long)elapsed) / 1000));
+    LOCK();
+    shared.fallCountdown = cd;
+    SAFE_STRCPY(shared.fallPhase, "pre_alert");
+    UNLOCK();
+
+    digitalWrite(BUZZER_PIN, (millis() % 200 < 100));
+
+    if (digitalRead(SOS_BUTTON_PIN) == LOW) {
+      LOCK();
+      shared.currentFall   = FALL_NONE;
+      shared.isFallen      = false;
+      shared.fallCountdown = 0;
+      SAFE_STRCPY(shared.fallPhase, "none");
+      UNLOCK();
+      digitalWrite(BUZZER_PIN, LOW);
+      buttonCancelledFall = true;
+      impactDetected      = false;
+      wentStillOnce       = false;
+      impactTime          = 0;
+      sosPresStart        = 0;
+      vTaskDelay(pdMS_TO_TICKS(500));
+      return;
+    }
+
+ if (elapsed > FALL_PRE_ALERT_MS) {
+      LOCK();
+      shared.currentFall = FALL_CONFIRMED;
+      shared.isFallen    = true;
+      shared.fallCount++;
+      int idx = min(shared.fallCount - 1, MAX_FALL_LOG - 1);
+      struct tm t;
+      if (getLocalTime(&t)) {
+        strftime(shared.fallTimes[idx], 10, "%H:%M", &t);
+      }               
+      SAFE_STRCPY(shared.fallPhase, "confirmed");
+      UNLOCK();
+      digitalWrite(BUZZER_PIN, LOW);
+      impactDetected = false;
+      wentStillOnce  = false;
+      impactTime     = 0;
+      queueAlert("⚠️ ตรวจพบการล้ม! กรุณาตรวจสอบ");
+    }
+  }  // ← ปิด if (currentFall == FALL_PRE_ALERT)
+
+  if (currentFall == FALL_CONFIRMED) {
+    unsigned long elapsed = millis() - fallTrigger;
+    if (elapsed > 5000UL) {
+      LOCK();
+      shared.currentFall   = FALL_NONE;
+      shared.isFallen      = false;
+      SAFE_STRCPY(shared.fallPhase, "none");
+      UNLOCK();
+    }
+    return;
+  }
+}  // ← ปิด handleFallDetection
+
+
+// ==========================================
+// TASK 1: SENSORS (Core 1)
+// ==========================================
+void SensorTask(void* pvParameters) {
+
+  // --- Heart Rate ---
+  int   baseline       = 2048;
+  int   smoothed       = 2048;
+  int   peakVal        = 0;
+  int   valleyVal      = 0;
+  bool  risingEdge     = false;
+  unsigned long lastBeatTime    = 0;
+  unsigned long risingEdgeStart = 0;
+  float ibiList[IBI_BUFFER_SIZE];
+  for (int i = 0; i < IBI_BUFFER_SIZE; i++) ibiList[i] = 800.0f;
+  int ibiIndex      = 0;
+  int ibiLocalCount = 0;
+
+  // --- Step ---
+  bool          valleyDetected = false;
+  unsigned long lastStepTime   = 0;
+
+  // --- Wrist ---
+  bool isWristUp = false;
+
+  // --- SOS ---
+  unsigned long sosPresStart        = 0;
+  bool          buttonCancelledFall = false;
+
+  // --- Fall ---
+  int           impactSamples  = 0;
+  bool          impactDetected = false;
+  unsigned long impactTime     = 0;
+  bool          wentStillOnce  = false;
+
+  for (;;) {
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+
+    float lx      = a.acceleration.x;
+    float ly      = a.acceleration.y;
+    float lz      = a.acceleration.z;
+    float ltotalG = sqrtf(lx*lx + ly*ly + lz*lz);
+    float pitch   = atan2f(-lx, sqrtf(ly*ly + lz*lz)) * 180.0f / PI;
+
+    float lgx      = g.gyro.x;
+    float lgy      = g.gyro.y;
+    float lgz      = g.gyro.z;
+    float lgyroMag = sqrtf(lgx*lgx + lgy*lgy + lgz*lgz);
+
+    // ----- Motion Engine -----
+    motionWin.push(ltotalG, lgyroMag);
+    ActivityState lActivity = classifyActivity();
+
+    // ==========================================
+    // Heart Rate & HRV
+    // ==========================================
+    int rawPulse = analogRead(HEART_RATE_PIN);
+
+    smoothed = ((10 - HR_LPF_ALPHA) * smoothed + HR_LPF_ALPHA * rawPulse) / 10;
+    baseline = ((100 - HR_ADAPTIVE_ALPHA) * baseline + HR_ADAPTIVE_ALPHA * smoothed) / 100;
+
+    int signal = smoothed - baseline;
+
+    int adaptiveThreshold = (int)((float)(peakVal - valleyVal) * HR_PEAK_RATIO);
+    adaptiveThreshold = max(adaptiveThreshold, HR_MIN_THRESHOLD);
+
+    // แก้: decay แบบ ratio แทน -1 ป้องกัน peakVal หายเร็วเกิน
+    if (peakVal   > 0) peakVal   = (int)(peakVal   * 0.99f);
+    if (valleyVal < 0) valleyVal = (int)(valleyVal  * 0.99f);
+
+    if (signal > peakVal)   peakVal   = signal;
+    if (signal < valleyVal) valleyVal = signal;
+
+    if (!risingEdge && signal > adaptiveThreshold) {
+      risingEdge      = true;
+      risingEdgeStart = millis();
+    }
+    if (risingEdge && millis() - risingEdgeStart > HR_PEAK_TIMEOUT_MS) {
+      risingEdge = false;
+    }
+
+    if (risingEdge && signal < adaptiveThreshold * 0.6f) {
+      risingEdge = false;
+
+      unsigned long now = millis();
+      unsigned long ibi = now - lastBeatTime;
+
+      // แก้: refractory filter — ข้าม IBI ที่ผิดปกติ ไม่ reset lastBeatTime
+      if (ibi < IBI_MIN_MS || ibi > IBI_MAX_MS) {
+        lastBeatTime = now;
+      } else {
+        int instantBPM = (int)(60000UL / ibi);
+
+        if (instantBPM >= HR_MIN_BPM && instantBPM <= HR_MAX_BPM) {
+          ibiList[ibiIndex] = (float)ibi;
+          ibiIndex = (ibiIndex + 1) % IBI_BUFFER_SIZE;
+          if (ibiLocalCount < IBI_BUFFER_SIZE) ibiLocalCount++;
+
+          bool ready = (ibiLocalCount >= IBI_BUFFER_SIZE);
+
+          LOCK();
+          shared.ibiFilledCount = ibiLocalCount;
+          shared.ibiReady       = ready;
+          UNLOCK();
+
+          if (ready) {
+            int   validN = min(ibiLocalCount, IBI_BUFFER_SIZE);
+            float avgIBI = 0.0f;
+            for (int i = 0; i < validN; i++) avgIBI += ibiList[i];
+            avgIBI /= (float)validN;
+
+            float sumDiffSq = 0.0f;
+            for (int i = 0; i < validN; i++) {
+              float d = ibiList[i] - avgIBI;
+              sumDiffSq += d * d;
+            }
+            float sdnn   = sqrtf(sumDiffSq / (float)validN);
+            int   stress = (sdnn >= 50.0f) ? 1 : (sdnn >= 35.0f) ? 2 : (sdnn >= 20.0f) ? 3 : 4;
+
+            LOCK();
+            shared.bpm         = (int)(60000.0f / avgIBI);
+            shared.hrvSDNN     = sdnn;
+            shared.stressLevel = stress;
+            UNLOCK();
+          }
+        }
+        lastBeatTime = now;
+      }
+    }
+
+    // แก้: Debug HR ปิด/เปิดด้วย #define DEBUG_HR
+#ifdef DEBUG_HR
+    static unsigned long lastHRDebug = 0;
+    if (millis() - lastHRDebug >= 20) {
+      lastHRDebug = millis();
+      Serial.print("raw:");      Serial.print(rawPulse);
+      Serial.print("\tsmooth:"); Serial.print(smoothed);
+      Serial.print("\tsignal:"); Serial.print(signal);
+      Serial.print("\tthresh:"); Serial.print(adaptiveThreshold);
+      Serial.print("\tbpm:");    Serial.println(shared.bpm);
+    }
+#endif
+
+    // ----- Step & Exercise -----
+    if (ltotalG < STEP_VALLEY_G) valleyDetected = true;
+    if (ltotalG > STEP_PEAK_G && valleyDetected &&
+        (millis() - lastStepTime > STEP_DEBOUNCE_MS)) {
+      lastStepTime   = millis();
+      valleyDetected = false;
+      LOCK(); shared.stepCount++; UNLOCK();
+    }
+    if (pitch > WRIST_UP_PITCH  && !isWristUp) isWristUp = true;
+    if (pitch < WRIST_DOWN_PITCH && isWristUp) {
+      isWristUp = false;
+      LOCK(); shared.exerciseCount++; UNLOCK();
+    }
+
+    // ----- Fall Detection -----
+    buttonCancelledFall = false;
+    handleFallDetection(
+      ltotalG, lgyroMag,
+      impactSamples, impactDetected,
+      impactTime, wentStillOnce,
+      buttonCancelledFall, sosPresStart
+    );
+
+    // ----- SOS Button -----
+    if (!buttonCancelledFall) {
+      bool btnPressed = (digitalRead(SOS_BUTTON_PIN) == LOW);
+      if (btnPressed) {
+        if (sosPresStart == 0) sosPresStart = millis();
+      if (millis() - sosPresStart > 3000) {
+          LOCK();
+          shared.isSOS = true;
+          shared.sosCount++;
+          int idx = min(shared.sosCount - 1, MAX_SOS_LOG - 1);
+          struct tm t;
+          if (getLocalTime(&t)) {
+            strftime(shared.sosTimes[idx], 10, "%H:%M", &t);
+          }
+          UNLOCK();
+          sosPresStart = 0;
+          queueAlert("🆘 SOS! ผู้สวมใส่ต้องการความช่วยเหลือ");
+          for (int i = 0; i < 3; i++) {
+            digitalWrite(BUZZER_PIN, HIGH); vTaskDelay(pdMS_TO_TICKS(80));
+            digitalWrite(BUZZER_PIN, LOW);  vTaskDelay(pdMS_TO_TICKS(80));
+          }
+        }
+      } else {
+        sosPresStart = 0;
+      }
+    }
+
+    // ----- อัปเดต shared -----
+    LOCK();
+    shared.x        = lx;
+    shared.y        = ly;
+    shared.z        = lz;
+    shared.totalG   = ltotalG;
+    shared.gyroMag  = lgyroMag;
+    shared.activity = lActivity;
+    UNLOCK();
+
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+// ==========================================
+// TASK 2: CLOUD & NETWORK (Core 0)
+// ==========================================
+String buildDailySummary(const SharedData& snap, const char* dateStr) {
+  String msg = "สรุปสุขภาพประจำวัน " + String(dateStr) + "\n";
+  msg += "ก้าวเดิน: " + String(snap.stepCount) + " ก้าว\n";
+  msg += "ออกกำลังกาย: " + String(snap.exerciseCount) + " ครั้ง\n";
+  if (snap.ibiReady) {
+    msg += "ชีพจร: " + String(snap.bpm) + " bpm\n";
+    msg += "HRV SDNN: " + String(snap.hrvSDNN, 1) + " ms\n";
+    String stressStr;
+    switch (snap.stressLevel) {
+      case 1: stressStr = "ต่ำมาก";  break;
+      case 2: stressStr = "ต่ำ";     break;
+      case 3: stressStr = "ปานกลาง"; break;
+      default: stressStr = "สูง";    break;
+    }
+    msg += "ความเครียด: " + stressStr + "\n";
+  } else {
+    msg += "ไม่มีข้อมูลชีพจรวันนี้\n";
+  }
+  msg += "การล้ม: " + String(snap.fallCount) + " ครั้ง\n";
+  for (int i = 0; i < min(snap.fallCount, MAX_FALL_LOG); i++) {
+    msg += "  ครั้งที่ " + String(i+1) + ": " + String(snap.fallTimes[i]) + "\n";
+  }
+
+  msg += "กดขอความช่วยเหลือ: " + String(snap.sosCount) + " ครั้ง\n";
+    for (int i = 0; i < min(snap.sosCount, MAX_SOS_LOG); i++) {
+    msg += "  ครั้งที่ " + String(i+1) + ": " + String(snap.sosTimes[i]) + "\n";
+  }
+  msg += "กิจกรรมล่าสุด: " + String(activityLabel[snap.activity]) + "\n";
+  msg += "คะแนนสุขภาพ: " + String(snap.healthScore) + "/100";
+  return msg;
+}
+void CloudTask(void* pvParameters) {
+  int lastSavedDay = -1;
+  int lastDailyReportDay = -1; 
+
+  unsigned long wifiBackoff   = WIFI_RECONNECT_BASE_MS;
+  unsigned long lastReconnect = 0;
+
+  for (;;) {
+    // แก้: disconnect ก่อน reconnect — ป้องกัน stuck
+    if (WiFi.status() != WL_CONNECTED) {
+      unsigned long now = millis();
+      if (now - lastReconnect >= wifiBackoff) {
+        Serial.println("[WiFi] Reconnecting...");
+        WiFi.disconnect();
+        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+        lastReconnect = now;
+        wifiBackoff   = min(wifiBackoff * 2, WIFI_RECONNECT_MAX_MS);
+      }
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
+    wifiBackoff = WIFI_RECONNECT_BASE_MS;
+
+    // drain alert queue
+    char alertBuf[ALERT_MSG_MAX];
+    while (xQueueReceive(alertQueue, alertBuf, 0) == pdTRUE) {
+      sendTelegramAlert(String(alertBuf));
+    }
+
+    if (!Firebase.ready()) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
+
+    LOCK();
+    SharedData snap = shared;
+    UNLOCK();
+
+    int score = map(constrain(snap.stepCount, 0, HEALTH_STEP_MAX),
+                    0, HEALTH_STEP_MAX, HEALTH_SCORE_BASE, HEALTH_SCORE_MAX);
+    if (snap.stressLevel >= STRESS_PENALTY_LVL) score -= STRESS_SCORE_PENALTY;
+    if (snap.activity == ACT_RUNNING)      score = min(score + 5, HEALTH_SCORE_MAX);
+    else if (snap.activity == ACT_WALKING) score = min(score + 2, HEALTH_SCORE_MAX);
+    score = constrain(score, 0, HEALTH_SCORE_MAX);
+    LOCK(); shared.healthScore = score;  UNLOCK();
+    snap.healthScore = score;
+
+    FirebaseJson json;
+    json.set("x",             snap.x);
+    json.set("y",             snap.y);
+    json.set("z",             snap.z);
+    json.set("total_g",       snap.totalG);
+    json.set("gyroMag",       snap.gyroMag);
+    json.set("heartRate",     snap.bpm);
+    json.set("hrvSDNN",       snap.hrvSDNN);
+    json.set("stressLevel",   snap.stressLevel);
+    json.set("ibiReady",      snap.ibiReady);
+    json.set("isFallen",      snap.isFallen);
+    json.set("isSOS",         snap.isSOS);
+    json.set("stepCount",     snap.stepCount);
+    json.set("exerciseCount", snap.exerciseCount);
+    json.set("healthScore",   snap.healthScore);
+    json.set("fallPhase",     String(snap.fallPhase));
+    json.set("fallCountdown", snap.fallCountdown);
+    json.set("activity",      String(activityLabel[snap.activity]));
+    json.set("fallCount",     snap.fallCount);   // ← เพิ่ม
+json.set("sosCount",      snap.sosCount);    // ← เพิ่ม
+
+    // แก้: log เมื่อ Firebase write ล้มเหลว
+    if (!Firebase.RTDB.setJSON(&fbdo, "/SmartGlove/Live", &json)) {
+      Serial.printf("[Firebase Error] %s\n", fbdo.errorReason().c_str());
+    }
+
+   struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+
+      // --- init วันแรก ---
+      if (lastSavedDay == -1) {
+        lastSavedDay = timeinfo.tm_mday;
+      }
+
+      // --- บันทึก history เมื่อวันเปลี่ยน ---
+      else if (timeinfo.tm_mday != lastSavedDay) {
+        char dateStr[20];
+        strftime(dateStr, sizeof(dateStr), "%Y-%m-%d", &timeinfo);
+        FirebaseJson history;
+        history.set("healthScore",   snap.healthScore);
+        history.set("stepCount",     snap.stepCount);
+        history.set("exerciseCount", snap.exerciseCount);
+        history.set("lastActivity",  String(activityLabel[snap.activity]));
+        if (!Firebase.RTDB.setJSON(&fbdo,
+              ("/SmartGlove/History/" + String(dateStr)).c_str(), &history)) {
+          Serial.printf("[Firebase History Error] %s\n", fbdo.errorReason().c_str());
+        }
+            LOCK(); 
+        shared.stepCount     = 0; 
+        shared.exerciseCount = 0;
+        shared.fallCount     = 0;
+        shared.sosCount      = 0;
+        UNLOCK();
+        lastSavedDay = timeinfo.tm_mday;
+      }
+
+      // --- ส่งรายงานหลังเที่ยงคืน ---
+      bool isMidnight = (timeinfo.tm_hour == 0 && timeinfo.tm_min == 0);
+      if (isMidnight && lastDailyReportDay != timeinfo.tm_mday) {
+        lastDailyReportDay = timeinfo.tm_mday;
+        time_t yesterday = mktime(&timeinfo) - 86400;
+        struct tm* ytm = localtime(&yesterday);
+        char dateStr[20];
+        strftime(dateStr, sizeof(dateStr), "%Y-%m-%d", ytm);
+        LOCK();
+        SharedData reportSnap = shared;
+        UNLOCK();
+        String summary = buildDailySummary(reportSnap, dateStr);
+        queueAlert(summary.c_str());
+        Serial.println("[Daily Report] Queued");
+      }
+
+    } // ปิด getLocalTime
+
+    // แก้: getBool แยก check ก่อน boolData()
+    if (Firebase.RTDB.getBool(&fbdo, "/SmartGlove/Control/resetSOS")) {
+      if (fbdo.boolData()) {
+        LOCK(); shared.isSOS = false; UNLOCK();
+        Firebase.RTDB.setBool(&fbdo, "/SmartGlove/Control/resetSOS", false);
+      }
+    }
+    if (Firebase.RTDB.getBool(&fbdo, "/SmartGlove/Control/resetFall")) {
+      if (fbdo.boolData()) {
+        LOCK();
+        shared.isFallen      = false;
+        shared.fallCountdown = 0;
+        shared.currentFall   = FALL_NONE;
+        SAFE_STRCPY(shared.fallPhase, "none");
+        UNLOCK();
+        Firebase.RTDB.setBool(&fbdo, "/SmartGlove/Control/resetFall", false);
+      }
+    }
+    if (Firebase.RTDB.getBool(&fbdo, "/SmartGlove/Control/findMe")) {
+      if (fbdo.boolData()) {
+        for (int i = 0; i < 5; i++) {
+          digitalWrite(BUZZER_PIN, HIGH); vTaskDelay(pdMS_TO_TICKS(100));
+          digitalWrite(BUZZER_PIN, LOW);  vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        Firebase.RTDB.setBool(&fbdo, "/SmartGlove/Control/findMe", false);
+      }
+    }
+       if (Firebase.RTDB.getBool(&fbdo, "/SmartGlove/Control/testReport")) {
+      if (fbdo.boolData()) {
+        LOCK();
+        SharedData reportSnap = shared;
+        UNLOCK();
+         struct tm testTime;          // ← ดึงเวลาใหม่ตรงนี้เลย
+        char dateStr[20];
+        if (getLocalTime(&testTime)) {
+          strftime(dateStr, sizeof(dateStr), "%Y-%m-%d", &testTime);
+        } else {
+          strcpy(dateStr, "TEST-DATE");
+        }
+        String summary = buildDailySummary(reportSnap, dateStr);
+        queueAlert(summary.c_str());
+        Serial.println("[Test] Manual report sent");
+        Firebase.RTDB.setBool(&fbdo, "/SmartGlove/Control/testReport", false);
+      }
+    }
+    
+
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
+
+// ==========================================
+// setup & loop
+// ==========================================
+void setup() {
+  Serial.begin(115200);
+  pinMode(BUZZER_PIN,     OUTPUT);
+  pinMode(SOS_BUTTON_PIN, INPUT_PULLUP);
+  Wire.begin();
+
+  analogSetAttenuation(ADC_11db);
+  analogReadResolution(12);
+  analogSetPinAttenuation(HEART_RATE_PIN, ADC_11db);
+
+  if (!mpu.begin()) {
+    Serial.println("[Error] MPU6050 ไม่พบ — ตรวจสอบสาย");
+    while (1) vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+
+  // แก้: ตั้งค่า MPU6050 ให้เหมาะกับ glove
+  mpu.setAccelerometerRange(MPU6050_RANGE_16_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+  dataMutex = xSemaphoreCreateMutex();
+  configASSERT(dataMutex);
+
+  alertQueue = xQueueCreate(ALERT_QUEUE_LEN, ALERT_MSG_MAX);
+  configASSERT(alertQueue);
+
+  memset(&shared, 0, sizeof(shared));
+  SAFE_STRCPY(shared.fallPhase, "none");
+  shared.stressLevel    = 1;
+  shared.activity       = ACT_STILL;
+  shared.currentFall    = FALL_NONE;
+  shared.ibiReady       = false;
+  shared.ibiFilledCount = 0;
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) delay(500);
+  Serial.println("[WiFi] Connected: " + WiFi.localIP().toString());
+
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+
+  config.api_key      = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  // แก้: log Firebase signup result
+  if (Firebase.signUp(&config, &auth, "", "")) {
+    Serial.println("[Firebase] Signup OK");
+  } else {
+    Serial.printf("[Firebase] Signup Failed: %s\n",
+                  config.signer.signupError.message.c_str());
+  }
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);   // แก้: ให้ Firebase auto-reconnect WiFi
+  // สร้าง Control อัตโนมัติ
+
+Firebase.RTDB.setBool(&fbdo, "/SmartGlove/Control/findMe", false);
+Firebase.RTDB.setBool(&fbdo, "/SmartGlove/Control/resetSOS", false);
+Firebase.RTDB.setBool(&fbdo, "/SmartGlove/Control/resetFall", false);
+Firebase.RTDB.setBool(&fbdo, "/SmartGlove/Control/testReport", false);
+
+  xTaskCreatePinnedToCore(SensorTask, "SensorTask", SENSOR_TASK_STACK, NULL, 3, &SensorTaskHandle, 1);
+  xTaskCreatePinnedToCore(CloudTask,  "CloudTask",  CLOUD_TASK_STACK,  NULL, 1, &CloudTaskHandle,  0);
+}
+
+// แก้: ใช้ portMAX_DELAY แทน vTaskDelete เพื่อไม่ให้ idle task หาย
+void loop() {
+  vTaskDelay(portMAX_DELAY);
+}
