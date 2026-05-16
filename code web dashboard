@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CareGlove Monitor</title>
+    <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-app.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-database.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { 
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; 
+            background: #0b0f1a; 
+            background-image: radial-gradient(circle at 50% -20%, #1e293b 0%, #0b0f1a 80%);
+            color: #e2e8f0; 
+            display: flex; flex-direction: column; align-items: center; 
+            padding: 20px; margin: 0; min-height: 100vh;
+        }
+        h1 { color: #ffffff; text-shadow: 0 0 15px rgba(56,189,248,0.5); font-weight: 800; letter-spacing: -1px; margin-bottom: 25px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(350px, 1fr)); gap: 20px; width: 95%; max-width: 1200px; }
+
+        /* ลบ backdrop-filter ออก — ตัวการหลักที่กิน GPU */
+        .card { 
+            background: rgba(30,41,59,0.95);
+            padding: 24px; border-radius: 20px; 
+            border: 1px solid rgba(255,255,255,0.1);
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+            /* ลบ transition hover ออก — ลด repaint */
+        }
+        .card:hover { border-color: rgba(56,189,248,0.4); }
+
+        .status { padding: 8px 16px; border-radius: 50px; font-size: 13px; margin-bottom: 25px; background: #1e293b; color: #94a3b8; border: 1px solid #334155; }
+        .online { color: #22c55e; border-color: #22c55e; background: rgba(34,197,94,0.1); }
+        .btn-group { display: flex; gap: 12px; margin-bottom: 30px; flex-wrap: wrap; justify-content: center; }
+        .btn { padding: 12px 24px; border: none; border-radius: 12px; font-weight: 700; cursor: pointer; transition: filter 0.2s; color: white; text-transform: uppercase; font-size: 11px; letter-spacing: 0.5px; display: flex; align-items: center; gap: 6px; }
+        .btn-find  { background: linear-gradient(135deg, #0ea5e9, #2563eb); }
+        .btn-reset { background: #334155; border: 1px solid #475569; }
+        .btn-pdf   { background: linear-gradient(135deg, #6366f1, #a855f7); }
+        .btn-fall  { background: linear-gradient(135deg, #ef4444, #dc2626); }
+        .btn-sos   { background: linear-gradient(135deg, #ef4444, #b91c1c); display: none; }
+        .btn:hover  { filter: brightness(1.2); }
+        .btn:active { filter: brightness(0.9); }
+
+        .exercise-card { border-bottom: 4px solid #10b981; }
+        .heart-card    { border-bottom: 4px solid #f43f5e; }
+        .step-card     { border-bottom: 4px solid #06b6d4; }
+        .score-card    { border: 1px solid rgba(168,85,247,0.5); background: rgba(168,85,247,0.05); text-align: center; grid-column: 1 / -1; }
+        .stress-card   { border-bottom: 4px solid #f97316; }
+
+        .counter-val { font-size: 4.5rem; font-weight: 900; margin: 5px 0; letter-spacing: -2px; }
+        .score-val  { color: #a855f7; }
+        .step-val   { color: #22d3ee; }
+        .stress-val { color: #fb923c; }
+        .heart-val  { color: #f43f5e; }
+        .motion-val { font-size: 3rem; color: #38bdf8; }
+
+        .bar-container { background: #0f172a; padding: 15px; border-radius: 15px; margin-top: 15px; }
+        .bar-bg   { width: 100%; height: 12px; background: #0b0f1a; border-radius: 10px; margin-top: 10px; overflow: hidden; border: 1px solid #334155; }
+        .bar-fill { height: 100%; border-radius: 10px; transition: width 0.8s ease-in-out; }
+        #healthBar      { background: linear-gradient(90deg, #a855f7, #6366f1); }
+        #stressLevelBar { background: linear-gradient(90deg, #f97316, #ef4444); }
+
+        .sos-alert { display: none; width: 95%; max-width: 1200px; background: linear-gradient(90deg, #ef4444, #b91c1c); color: white; padding: 20px; border-radius: 15px; margin-bottom: 25px; text-align: center; font-size: 1.2rem; font-weight: 800; animation: pulse-red 1.5s infinite; }
+        @keyframes pulse-red { 0%{transform:scale(1);} 50%{transform:scale(1.02);opacity:0.8;} 100%{transform:scale(1);} }
+
+        .fall-alert-bar { display: none; width: 95%; max-width: 1200px; background: linear-gradient(90deg, #f59e0b, #d97706); color: white; padding: 20px; border-radius: 15px; margin-bottom: 25px; text-align: center; animation: pulse-amber 1s infinite; }
+        @keyframes pulse-amber { 0%{box-shadow:0 0 0 0 rgba(245,158,11,0.7);} 70%{box-shadow:0 0 0 15px rgba(245,158,11,0);} 100%{box-shadow:0 0 0 0 rgba(245,158,11,0);} }
+
+        .cancel-btn { background: white; color: #b45309; border: none; padding: 10px 25px; border-radius: 50px; font-weight: 800; cursor: pointer; margin-top: 10px; font-size: 14px; transition: filter 0.2s; display: inline-flex; align-items: center; gap: 6px; }
+        .cancel-btn:hover { filter: brightness(0.95); }
+
+        .countdown-num { font-size: 2.5rem; font-weight: 900; margin: 0 10px; display: inline-block; animation: blink 1s infinite; }
+        @keyframes blink { 50%{ opacity: 0.7; } }
+
+        .ibi-warming { color: #f59e0b; font-size: 0.8rem; margin-top: 4px; }
+
+        .history-list { background: #0f172a; border-radius: 12px; padding: 10px; border: 1px solid #1e293b; max-height: 200px; overflow-y: auto; }
+        .history-item { color: #f87171; border-bottom: 1px solid #1e293b; padding: 10px; font-size: 0.9rem; }
+        .value-display { font-family: monospace; background: #0f172a; padding: 10px; border-radius: 8px; margin-top: 15px; display: flex; gap: 20px; justify-content: center; }
+
+        .toast { position: fixed; bottom: 30px; right: 30px; background: #1e293b; color: #22c55e; padding: 15px 25px; border-radius: 12px; border-left: 4px solid #22c55e; box-shadow: 0 10px 40px rgba(0,0,0,0.4); display: none; z-index: 1000; }
+
+        @media print {
+            body { background: white !important; color: black !important; }
+            .card { border: 1px solid #000 !important; background: white !important; color: black !important; }
+            .btn-group, canvas, .sos-alert, .fall-alert-bar, .toast { display: none !important; }
+        }
+    </style>
+</head>
+<body>
+
+<div id="fallAlertBar" class="fall-alert-bar">
+    <div style="font-size:1.1rem;margin-bottom:8px;">
+        ⚠️ ตรวจพบการกระแทก! กำลังนับถอยหลัง
+        <span id="fallCountdownNum" class="countdown-num">7</span> วินาที
+    </div>
+    <div style="font-size:0.9rem;opacity:0.95;margin-bottom:12px;">หากไม่ล้ม → กดปุ่มนี้เพื่อยกเลิกการแจ้งเตือน</div>
+    <button id="cancelFallBtn" class="cancel-btn">🛑 ยกเลิกการแจ้งเตือน</button>
+</div>
+
+<div id="sosIndicator" class="sos-alert">🚨 EMERGENCY ALERT: SOS BUTTON PRESSED! 🚨</div>
+<div id="toast" class="toast"></div>
+
+<h1>🧤 CareGlove Monitor</h1>
+
+<div class="btn-group">
+    <button id="findGloveBtn"     class="btn btn-find" >🔍 Find My Glove</button>
+    <button id="resetSOSBtn"      class="btn btn-sos"  >🆘 Clear SOS</button>
+    <button onclick="generatePDF()" class="btn btn-pdf">📄 Export</button>
+</div>
+
+<div id="status" class="status">Initializing System...</div>
+
+<div class="grid">
+    <div class="card score-card">
+        <h3 style="color:#a855f7;">🏆 DAILY HEALTH SCORE</h3>
+        <div id="valHealthScore" class="counter-val score-val">--</div>
+        <div class="bar-container">
+            <span id="healthAdvice" style="font-size:0.9rem;color:#94a3b8;">Analyzing Vitals...</span>
+            <div class="bar-bg"><div id="healthBar" class="bar-fill" style="width:0%;"></div></div>
+        </div>
+    </div>
+
+    <div class="card" style="grid-column: 1 / -1;">
+        <h3 style="color:#38bdf8;">📊 WEEKLY ACTIVITY TREND</h3>
+        <canvas id="weeklyTrendChart" style="max-height:300px;width:100%;"></canvas>
+    </div>
+
+    <div class="card motion-card">
+        <h3>🏃 MOTION ENGINE</h3>
+        <div id="valMotion" class="motion-val">--</div>
+        <p style="color:#94a3b8;">System Monitoring Active</p>
+    </div>
+
+    <div class="card step-card">
+        <h3>🚶 STEP TRACKER</h3>
+        <div id="valStep" class="counter-val step-val">0</div>
+        <div style="display:flex;justify-content:space-around;font-size:0.9rem;margin-top:10px;">
+            <span>Dist: <b id="valDist">0</b> m</span>
+            <span>Burn: <b id="valCal">0</b> kcal</span>
+        </div>
+    </div>
+
+    <div class="card stress-card">
+        <h3>🧠 STRESS ANALYSIS</h3>
+        <div id="valStress" class="counter-val stress-val">--</div>
+        <div class="bar-container">
+            <span id="stressAdvice" style="font-size:0.9rem;color:#94a3b8;">Monitoring...</span>
+            <div class="bar-bg"><div id="stressLevelBar" class="bar-fill" style="width:0%;"></div></div>
+        </div>
+    </div>
+
+    <div class="card heart-card">
+        <h3>❤️ HEART RATE (BPM)</h3>
+        <div id="valHeart" class="counter-val heart-val">--</div>
+        <div id="ibiWarning" class="ibi-warming" style="display:none;">⏳ กำลังเก็บข้อมูล... รอสักครู่</div>
+        <div style="display:flex;justify-content:space-around;font-size:0.8rem;margin-bottom:10px;">
+            <span id="arrhythmiaStatus" style="color:#22c55e;">RHYTHM: --</span>
+            <span>SDNN: <b id="valHRV">--</b> ms</span>
+        </div>
+        <canvas id="heartChart"></canvas>
+    </div>
+
+    <div class="card exercise-card">
+        <h3>🏋️ WRIST EXERCISE</h3>
+        <div id="valExercise" class="counter-val" style="color:#10b981;">0</div>
+        <p style="color:#94a3b8;">🩺 Tremor: None</p>
+    </div>
+
+    <div class="card" style="border-color:#ef4444;">
+        <h3 style="color:#ef4444;">🚨 INCIDENT LOG</h3>
+        <div id="fallHistory" class="history-list">
+            <div class="history-item" style="color:#475569;">No incidents.</div>
+        </div>
+    </div>
+
+    <div class="card">
+        <h3 style="color:#94a3b8;">AXIS TELEMETRY (X, Y, Z)</h3>
+        <canvas id="xyzChart"></canvas>
+        <div class="value-display">
+            <span style="color:#ef4444">X: <span id="valX">0</span></span>
+            <span style="color:#22c55e">Y: <span id="valY">0</span></span>
+            <span style="color:#3b82f6">Z: <span id="valZ">0</span></span>
+        </div>
+    </div>
+
+    <div class="card">
+        <h3 style="color:#fbbf24;">RESULTANT FORCE (G)</h3>
+        <canvas id="gChart"></canvas>
+        <div class="value-display">
+            <span style="color:#fbbf24">G-Force: <span id="valG">0</span> m/s²</span>
+        </div>
+    </div>
+</div>
+
+<script>
+    const firebaseConfig = {
+        apiKey: "AIzaSyAY9TqQEY_PsbC2dHniwKVQCJFkmMGRlTI",
+        databaseURL: "https://glove-a8c55-default-rtdb.asia-southeast1.firebasedatabase.app"
+    };
+    firebase.initializeApp(firebaseConfig);
+    const db = firebase.database();
+
+    // ==========================================
+    // Toast
+    // ==========================================
+    function showToast(message, type = 'success') {
+        const toast = document.getElementById('toast');
+        toast.textContent = message;
+        toast.style.borderLeftColor = type === 'success' ? '#22c55e' : '#ef4444';
+        toast.style.color           = type === 'success' ? '#22c55e' : '#f87171';
+        toast.style.display = 'block';
+        setTimeout(() => { toast.style.display = 'none'; }, 3000);
+    }
+
+    // ==========================================
+    // Buttons
+    // ==========================================
+    document.getElementById('findGloveBtn').addEventListener('click', () => {
+        db.ref("/SmartGlove/Control").update({ findMe: true });
+        showToast("🔍 Locate command sent!");
+    });
+    document.getElementById('resetSOSBtn').addEventListener('click', () => {
+        db.ref("/SmartGlove/Control/resetSOS").set(true);
+        showToast("🆘 SOS cleared!");
+    });
+    document.getElementById('cancelFallBtn').addEventListener('click', () => {
+        db.ref("/SmartGlove/Control/resetFall").set(true);
+        showToast("🛑 Fall alert cancelled!");
+    });
+    function generatePDF() {
+        showToast("📄 Generating report...");
+        setTimeout(() => { window.print(); }, 500);
+    }
+
+    // ==========================================
+    // Charts — ปิด animation, ซ่อน legend, ลด points
+    // ==========================================
+    Chart.defaults.color       = '#94a3b8';
+    Chart.defaults.borderColor = 'rgba(255,255,255,0.1)';
+
+    const commonOptions = {
+        animation: false,
+        responsive: true,
+        maintainAspectRatio: true,
+        plugins: { legend: { display: false } },
+        elements: { point: { radius: 0 } },
+        scales: { y: { beginAtZero: false } }
+    };
+
+    const xyzChart = new Chart(document.getElementById('xyzChart'), {
+        type: 'line',
+        data: { labels: Array(20).fill(''), datasets: [
+            { label: 'X', data: [], borderColor: '#ef4444', borderWidth: 1.5 },
+            { label: 'Y', data: [], borderColor: '#22c55e', borderWidth: 1.5 },
+            { label: 'Z', data: [], borderColor: '#3b82f6', borderWidth: 1.5 }
+        ]},
+        options: commonOptions
+    });
+
+    const gChart = new Chart(document.getElementById('gChart'), {
+        type: 'line',
+        data: { labels: Array(20).fill(''), datasets: [
+            { label: 'G', data: [], borderColor: '#fbbf24', borderWidth: 1.5, fill: true, backgroundColor: 'rgba(251,191,36,0.08)' }
+        ]},
+        options: { ...commonOptions, scales: { y: { min: 0, max: 40 } } }
+    });
+
+    const heartChart = new Chart(document.getElementById('heartChart'), {
+        type: 'line',
+        data: { labels: Array(20).fill(''), datasets: [
+            { label: 'BPM', data: [], borderColor: '#f43f5e', borderWidth: 1.5, fill: true, backgroundColor: 'rgba(244,63,94,0.08)' }
+        ]},
+        options: { ...commonOptions, scales: { y: { min: 40, max: 180 } } }
+    });
+
+    const weeklyTrendChart = new Chart(document.getElementById('weeklyTrendChart').getContext('2d'), {
+        type: 'line',
+        data: {
+            labels: ['', '', '', '', '', '', 'Today'],
+            datasets: [
+                { label: 'Health Score', data: [0,0,0,0,0,0,0], borderColor: '#a855f7', fill: true, tension: 0.4, backgroundColor: 'rgba(168,85,247,0.08)' },
+                { label: 'Steps',        data: [0,0,0,0,0,0,0], borderColor: '#06b6d4', yAxisID: 'y1', tension: 0.4 }
+            ]
+        },
+        options: {
+            animation: false,
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { display: true } },
+            scales: { y1: { position: 'right' } }
+        }
+    });
+
+const MAX_POINTS = 20;
+
+function pushChart(chart, ...values) {
+
+    chart.data.datasets.forEach((ds, i) => {
+
+        if (ds.data.length >= MAX_POINTS) {
+            ds.data.shift();
+        }
+
+        ds.data.push(values[i] ?? 0);
+    });
+
+    chart.update('none');
+}
+    // ==========================================
+    // Fall alert UI — ไม่แตะ sosIndicator
+    // ==========================================
+    let currentFallPhase = "none";
+    let lastFallState    = false;
+    let lastSOSState     = false;
+    let sosAutoHideTimer = null;
+    let lastFallCount = 0;
+    let lastSOSCount  = 0;
+
+    function updateFallAlertUI(phase, countdown) {
+        const fallBar = document.getElementById('fallAlertBar');
+        if (phase === "pre_alert") {
+            fallBar.style.display = 'block';
+            document.getElementById('fallCountdownNum').innerText = countdown;
+        } else if (phase === "confirmed") {
+    fallBar.style.display = 'none';
+} else {
+            fallBar.style.display = 'none';
+        }
+    }
+
+    // ==========================================
+    // applyUpdate — DOM updates ทั้งหมด
+    // ==========================================
+    const stressLabels   = ["", "😌 Relaxed", "😐 Normal", "😰 Stressed", "🚨 Critical"];
+    const motionColorMap = { "Fall Detected!": '#ef4444', "SOS Alert!": '#f97316', "Impact Check...": '#f59e0b' };
+    const healthAdviceMap = [
+        { min: 90, msg: "🌟 ดีเยี่ยม รักษาระดับนี้ไว้", color: "#22c55e" },
+        { min: 75, msg: "👍 ดี ควรรักษาการเคลื่อนไหวต่อเนื่อง",     color: "#a3e635" },
+        { min: 60, msg: "😐 ปานกลาง ควรขยับร่างกายเพิ่ม",color: "#fbbf24" },
+        { min:  0, msg: "⚠️ ต่ำ ควรพักผ่อนและดื่มน้ำ",   color: "#ef4444" }
+    ];
+
+    // cache DOM refs — ไม่ querySelector ซ้ำทุก tick
+    const el = {
+        status:          document.getElementById('status'),
+        valX:            document.getElementById('valX'),
+        valY:            document.getElementById('valY'),
+        valZ:            document.getElementById('valZ'),
+        valG:            document.getElementById('valG'),
+        valHealthScore:  document.getElementById('valHealthScore'),
+        healthBar:       document.getElementById('healthBar'),
+        healthAdvice:    document.getElementById('healthAdvice'),
+        valStep:         document.getElementById('valStep'),
+        valDist:         document.getElementById('valDist'),
+        valCal:          document.getElementById('valCal'),
+        valExercise:     document.getElementById('valExercise'),
+        ibiWarning:      document.getElementById('ibiWarning'),
+        valHeart:        document.getElementById('valHeart'),
+        valHRV:          document.getElementById('valHRV'),
+        arrhythmia:      document.getElementById('arrhythmiaStatus'),
+        valStress:       document.getElementById('valStress'),
+        stressLevelBar:  document.getElementById('stressLevelBar'),
+        stressAdvice:    document.getElementById('stressAdvice'),
+        valMotion:       document.getElementById('valMotion'),
+        fallCountdown:   document.getElementById('fallCountdownNum'),
+        sosIndicator:    document.getElementById('sosIndicator'),
+        resetSOSBtn:     document.getElementById('resetSOSBtn'),
+        motionCard:      document.querySelector('.motion-card'),
+    };
+
+    function applyUpdate(data) {
+        el.status.innerText  = "• SYSTEM ONLINE";
+        el.status.className  = "status online";
+
+        // Telemetry
+        el.valX.innerText = (data.x       || 0).toFixed(2);
+        el.valY.innerText = (data.y       || 0).toFixed(2);
+        el.valZ.innerText = (data.z       || 0).toFixed(2);
+        el.valG.innerText = (data.total_g || 0).toFixed(2);
+
+        // Health Score
+        const score = data.healthScore || 0;
+        el.valHealthScore.innerText = score;
+        el.healthBar.style.width    = score + "%";
+        const advice = healthAdviceMap.find(a => score >= a.min);
+        el.healthAdvice.innerText   = advice.msg;
+        el.healthAdvice.style.color = advice.color;
+
+        // Steps
+        const steps = data.stepCount || 0;
+        el.valStep.innerText = steps;
+        el.valDist.innerText = (steps * 0.7).toFixed(1);
+        el.valCal.innerText  = (steps * 0.04).toFixed(1);
+
+        // Exercise
+        el.valExercise.innerText = data.exerciseCount || 0;
+
+        // Heart Rate
+        const ibiReady = data.ibiReady === true;
+        el.ibiWarning.style.display = ibiReady ? 'none' : 'block';
+        el.valHeart.innerText = data.heartRate || '--';
+        el.valHRV.innerText         = ibiReady ? (data.hrvSDNN   || 0).toFixed(1) : '--';
+        if (ibiReady) {
+            const bpm = data.heartRate || 0;
+            el.arrhythmia.innerText = bpm < 60 ? "⚠️ BRADYCARDIA" : bpm > 100 ? "⚠️ TACHYCARDIA" : "RHYTHM: NORMAL";
+        }
+
+        // Stress
+        if (data.stressLevel !== undefined) {
+            el.valStress.innerText       = data.stressLevel;
+            el.stressLevelBar.style.width= (data.stressLevel * 25) + "%";
+            el.stressAdvice.innerText    = stressLabels[data.stressLevel] || "Monitoring...";
+        }
+
+        // Motion
+        const motionVal = data.activity || "IDLE";
+        el.valMotion.innerText   = motionVal;
+        el.valMotion.style.color = motionColorMap[motionVal] || '#38bdf8';
+
+        // Fall Phase
+        const fallPhase     = data.fallPhase    || "none";
+        const fallCountdown = data.fallCountdown !== undefined ? data.fallCountdown : 7;
+        if (fallPhase !== currentFallPhase) {
+            currentFallPhase = fallPhase;
+            updateFallAlertUI(fallPhase, fallCountdown);
+        }
+        if (fallPhase === "pre_alert") {
+            el.fallCountdown.innerText = fallCountdown;
+        }
+
+        // SOS
+        if (data.isSOS) {
+            el.sosIndicator.style.display = 'block';
+            el.resetSOSBtn.style.display  = 'flex';
+          if (!lastSOSState) {
+    clearTimeout(sosAutoHideTimer);
+                sosAutoHideTimer = setTimeout(() => {
+                    db.ref("/SmartGlove/Control/resetSOS").set(true);
+                }, 60000);
+            }
+        } else {
+            el.sosIndicator.style.display = 'none';
+            el.resetSOSBtn.style.display  = 'none';
+            clearTimeout(sosAutoHideTimer);
+        }
+        lastSOSState = !!data.isSOS;
+
+        // Fall flash
+        if (data.isFallen && !lastFallState) {
+            el.motionCard.style.borderColor = '#ef4444';
+            setTimeout(() => { el.motionCard.style.borderColor = ''; }, 3000);
+        }
+        lastFallState = !!data.isFallen;
+        const fallCount = data.fallCount || 0;
+if (fallCount > lastFallCount) {
+    for (let i = lastFallCount; i < fallCount; i++) {
+        addHistory("🚨 FALL CONFIRMED ครั้งที่ " + (i + 1));
+    }
+    lastFallCount = fallCount;
+}
+
+const sosCount = data.sosCount || 0;
+if (sosCount > lastSOSCount) {
+    for (let i = lastSOSCount; i < sosCount; i++) {
+        addHistory("🆘 SOS กดขอความช่วยเหลือ ครั้งที่ " + (i + 1));
+    }
+    lastSOSCount = sosCount;
+}
+
+        // Charts — แยก frame
+        requestAnimationFrame(() => {
+            pushChart(xyzChart, data.x || 0, data.y || 0, data.z || 0);
+            pushChart(gChart,   data.total_g || 0);
+            if (ibiReady) pushChart(heartChart, data.heartRate || 0);
+        });
+    }
+
+    // ==========================================
+    // Firebase listener — throttle ด้วย RAF
+    // ==========================================
+    let pendingData  = null;
+    let rafScheduled = false;
+
+    db.ref("/SmartGlove/Live").on("value", (snapshot) => {
+        const data = snapshot.val();
+        if (!data) return;
+        pendingData = data;
+        if (!rafScheduled) {
+            rafScheduled = true;
+            requestAnimationFrame(() => {
+                applyUpdate(pendingData);
+                rafScheduled = false;
+            });
+        }
+    });
+
+    // ==========================================
+    // History log
+    // ==========================================
+    function addHistory(msg) {
+        const box = document.getElementById('fallHistory');
+        if (box.innerText.includes("No incidents")) box.innerHTML = "";
+        const entry = document.createElement('div');
+        entry.className = "history-item";
+        entry.innerHTML = `<b>${msg}</b> — ${new Date().toLocaleTimeString()}`;
+        box.prepend(entry);
+    }
+
+    // ==========================================
+    // Weekly trend
+    // ==========================================
+    db.ref("/SmartGlove/History").limitToLast(7).on("value", (snap) => {
+        const history = snap.val();
+        if (!history) return;
+        const keys   = Object.keys(history).sort();
+        const labels = keys.map(k => k.slice(5));
+        const scores = keys.map(k => history[k].healthScore || 0);
+        const steps  = keys.map(k => history[k].stepCount   || 0);
+        while (labels.length < 7) { labels.unshift(''); scores.unshift(0); steps.unshift(0); }
+        weeklyTrendChart.data.labels           = labels;
+        weeklyTrendChart.data.datasets[0].data = scores;
+        weeklyTrendChart.data.datasets[1].data = steps;
+        weeklyTrendChart.update('none');
+    });
+</script>
+</body>
+</html>
